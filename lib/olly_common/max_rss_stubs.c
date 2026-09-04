@@ -1,5 +1,28 @@
 /*
- * max_rss_stubs.c — poll peak RSS (VmHWM) for a running process.
+ * max_rss_stubs.c — sample the resident set size of a running process.
+ *
+ * IMPORTANT: on Linux this deliberately does NOT report VmHWM.  olly traces
+ * through a runtime_events ring, which is a file-backed mmap ("<pid>.events")
+ * that the kernel counts in the traced process's RSS.  The ring is sized by
+ * OCAMLRUNPARAM `e` (log2 words per domain) times `d` (max domains), so it is
+ * routinely hundreds of MB — with e=25,d=2 it is 512 MB.  Reporting VmHWM
+ * therefore attributed olly's own instrumentation to the program under
+ * measurement: a benchmark with a 500 MB footprint measured ~1 GB, a 100%
+ * overstatement, and one that grew with the ring size rather than with anything
+ * the program did.
+ *
+ * Instead we sum the per-mapping Rss from /proc/<pid>/smaps, skipping the
+ * ".events" ring.  That is the program's own resident footprint.  The trade-off
+ * is deliberate: VmHWM is an exact kernel-maintained high-water mark, whereas
+ * smaps gives the *current* breakdown, so the caller (Rss_poller) turns it into
+ * a peak by sampling.  A peak that is sampled but measures the right thing beats
+ * an exact peak that measures the wrong one; raise the sampling rate
+ * (--rss-freq) if a short-lived spike matters.
+ *
+ * macOS and FreeBSD keep their existing whole-process readings — neither
+ * exposes a cheap per-mapping RSS breakdown, so the ring cannot be excluded
+ * there.  Those platforms are unaffected by this change (and olly's tracing is
+ * Linux-centric in practice).
  *
  * On Linux these are all in the same /proc/<pid>/status text file, so
  * collecting them requires no extra syscalls — just scanning more lines
@@ -43,26 +66,46 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Sum Rss across all mappings except the runtime_events ring.
+ *
+ * smaps alternates a mapping header with that mapping's fields:
+ *
+ *   7f3c1a000000-7f3c1a400000 rw-s 00000000 00:19 12345  /tmp/…/4242.events
+ *   Rss:                4096 kB
+ *   …
+ *
+ * A header's first whitespace-delimited token is an address range, which does
+ * not end in ':'; a field line's does ("Rss:").  That distinction is what tells
+ * the two apart, so we track whether the mapping we are inside is the ring and
+ * skip its Rss.  Reading smaps is more expensive than status (the kernel walks
+ * the page tables), which is why this is sampled rather than read per event.
+ */
 CAMLprim value olly_get_rss_kb(value v_pid) {
   int pid = Int_val(v_pid);
   char path[64];
-  char line[256];
-  long vmhwm = 0;
+  char line[4096];
+  long total = 0;
+  int in_events_ring = 0;
   FILE *f;
 
-  snprintf(path, sizeof(path), "/proc/%d/status", pid);
+  snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
   f = fopen(path, "r");
   if (!f)
     return Val_long(0);
 
   while (fgets(line, sizeof(line), f)) {
-    if (strncmp(line, "VmHWM:", 6) == 0) {
-      sscanf(line + 6, " %ld", &vmhwm);
-      break;
+    char *sp = strchr(line, ' ');
+    if (sp && sp > line && *(sp - 1) != ':') {
+      /* mapping header: decide whether to count this mapping at all */
+      in_events_ring = (strstr(line, ".events") != NULL);
+    } else if (!in_events_ring && strncmp(line, "Rss:", 4) == 0) {
+      long rss = 0;
+      sscanf(line + 4, " %ld", &rss);
+      total += rss;
     }
   }
   fclose(f);
-  return Val_long(vmhwm);
+  return Val_long(total);
 }
 
 #elif defined(__APPLE__)

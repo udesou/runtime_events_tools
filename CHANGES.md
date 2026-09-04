@@ -8,6 +8,15 @@
 * Report a failure to launch or attach to the traced process as an error
   rather than an uncaught exception, and don't print empty statistics
   when nothing was collected (@ngorogiannis)
+* `gc-stats`: exclude the runtime_events ring from the reported max RSS on Linux,
+  so the figure measures the traced program rather than olly's own
+  instrumentation. Previously `max_rss_kb` came from `VmHWM`, which counts the
+  file-backed `<pid>.events` mmap — routinely hundreds of MB (512 MB at
+  `e=25,d=2`), overstating a 500 MB benchmark by ~100%. The value is now a
+  sampled peak of the ring-free resident set rather than an exact kernel
+  high-water mark; use `--rss-freq` if short spikes matter.
+
+### 0.5.3
 * Report lost events count only at end of run (#96, @ngorogiannis)
 * Sample max RSS usage from a dedicated domain (#95, @ngorogiannis)
 * Record and don't crash on latencies above histogram threshold (#93, @ngorogiannis)
